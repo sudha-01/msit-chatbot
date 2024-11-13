@@ -14,7 +14,7 @@ from nltk.tokenize import sent_tokenize
 import io
 
 # Download NLTK data
-nltk.download('punkt')
+nltk.download('punkt_tab')
 
 
 class DocumentProcessor:
