@@ -1,316 +1,233 @@
-# app.py
-
 import streamlit as st
-import time
 import json
-from typing import List, Dict
-import torch
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from sentence_transformers import SentenceTransformer
+import requests
 import faiss
 import numpy as np
-import nltk
-from nltk.tokenize import sent_tokenize
-import io
+from sentence_transformers import SentenceTransformer
+import torch
+from typing import List, Dict
+import re
 
-# Download NLTK data
-nltk.download('punkt_tab')
-nltk.download('wordnet')
-nltk.download('omw-1.4')
+# Initialize Streamlit session state to maintain conversation history
+if 'conversation_history' not in st.session_state:
+    st.session_state.conversation_history = []
 
 
 class DocumentProcessor:
-    def __init__(self, chunk_size=3):
-        self.chunk_size = chunk_size
+    """Class to handle document processing and chunking"""
 
-    def clean_text(self, text: str) -> str:
-        """Clean the text content"""
-        # Remove multiple spaces
-        text = ' '.join(text.split())
-        # Remove very long token strings (likely garbage from PDF)
-        text = ' '.join(word for word in text.split() if len(word) < 30)
-        return text
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Clean the text by removing extra whitespace and special characters"""
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep punctuation
+        text = re.sub(r'[^\w\s.,!?-]', '', text)
+        return text.strip()
 
-    def load_jsonl(self, file_path: str) -> List[Dict]:
-        """Load data from JSONL file"""
-        data = []
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                for line in file:
-                    try:
-                        item = json.loads(line)
-                        if all(key in item for key in ['url', 'type', 'content']):
-                            data.append(item)
-                    except json.JSONDecodeError:
-                        print(f"Skipping invalid JSON line: {line[:100]}...")
-        except Exception as e:
-            print(f"Error loading file: {str(e)}")
-        return data
-
-    def extract_text_from_jsonl(self, data: List[Dict]) -> List[Dict[str, str]]:
-        """Extract text content from JSONL data with metadata"""
-        processed_texts = []
-
-        for item in data:
-            if item['content'] and isinstance(item['content'], str):
-                cleaned_text = self.clean_text(item['content'])
-                if len(cleaned_text.split()) >= 10:  # Only keep substantial content
-                    processed_texts.append({
-                        'text': cleaned_text,
-                        'url': item['url'],
-                        'type': item['type']
-                    })
-
-        return processed_texts
-
-    def create_chunks(self, texts: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Create chunks from texts while preserving metadata"""
+    @staticmethod
+    def create_semantic_chunks(documents: List[Dict], max_chunk_size: int = 512) -> List[Dict]:
+        """Create semantic chunks from documents"""
         chunks = []
 
-        for text_item in texts:
-            # Split into sentences
-            sentences = sent_tokenize(text_item['text'])
+        for doc in documents:
+            content = doc['content']
+            # Split content into sentences (basic approach)
+            sentences = re.split(r'(?<=[.!?])\s+', content)
 
-            # Create chunks of sentences
-            for i in range(0, len(sentences), self.chunk_size):
-                chunk_text = ' '.join(sentences[i:i + self.chunk_size])
-                if len(chunk_text.split()) >= 10:  # Only keep chunks with at least 10 words
+            current_chunk = ""
+            current_url = doc['url']
+            current_type = doc['type']
+
+            for sentence in sentences:
+                # If adding new sentence exceeds max_chunk_size, save current chunk and start new one
+                if len(current_chunk) + len(sentence) > max_chunk_size and current_chunk:
                     chunks.append({
-                        'text': chunk_text,
-                        'url': text_item['url'],
-                        'type': text_item['type']
+                        'url': current_url,
+                        'type': current_type,
+                        'content': DocumentProcessor.clean_text(current_chunk)
                     })
+                    current_chunk = sentence
+                else:
+                    current_chunk += " " + sentence if current_chunk else sentence
+
+            # Add the last chunk if it exists
+            if current_chunk:
+                chunks.append({
+                    'url': current_url,
+                    'type': current_type,
+                    'content': DocumentProcessor.clean_text(current_chunk)
+                })
 
         return chunks
 
+    @staticmethod
+    def load_jsonl(file) -> List[Dict]:
+        """Load and parse JSONL file"""
+        documents = []
+        content = file.getvalue().decode('utf-8')
+        for line in content.strip().split('\n'):
+            try:
+                doc = json.loads(line)
+                if all(k in doc for k in ['url', 'type', 'content']):  # Validate required fields
+                    documents.append(doc)
+                else:
+                    st.warning(f"Skipping invalid document: missing required fields")
+            except json.JSONDecodeError:
+                st.warning(f"Skipping invalid JSON line")
+        return documents
 
-class RAGSystem:
-    def __init__(self):
-        # Initialize GPT-2 model and tokenizer
-        self.llm = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.llm_tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
 
-        # Initialize sentence transformer for embeddings
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+class VectorStore:
+    """Class to handle vector storage and retrieval"""
 
-        # Initialize FAISS index
-        self.vector_dimension = 384
-        self.vector_index = faiss.IndexFlatL2(self.vector_dimension)
+    def __init__(self, model_name: str = 'all-mpnet-base-v2'):
+        self.model = SentenceTransformer(model_name)
+        self.dimension = self.model.get_sentence_embedding_dimension()
+        self.index = None
+        self.documents = []
 
-        # Storage for documents and metadata
-        self.documents: List[Dict[str, str]] = []
+    def create_embeddings(self, chunks: List[Dict]):
+        """Create embeddings for chunks and build FAISS index"""
+        embeddings = []
+        self.documents = chunks
 
-    def add_documents(self, documents: List[Dict[str, str]]):
-        """Add documents to the knowledge base"""
-        # Store documents with metadata
-        self.documents.extend(documents)
+        # Show progress bar for embedding creation
+        progress_bar = st.progress(0)
+        for idx, chunk in enumerate(chunks):
+            embedding = self.model.encode(chunk['content'], convert_to_tensor=True)
+            embeddings.append(embedding.cpu().numpy())
+            progress_bar.progress((idx + 1) / len(chunks))
 
-        # Create embeddings for the text content
-        embeddings = self.embedding_model.encode([doc['text'] for doc in documents])
+        embeddings_array = np.array(embeddings).astype('float32')
 
-        # Add to FAISS index
-        self.vector_index.add(np.array(embeddings).astype('float32'))
+        # Create FAISS index
+        self.index = faiss.IndexFlatL2(self.dimension)
+        self.index.add(embeddings_array)
+        progress_bar.empty()  # Remove progress bar after completion
 
-        return len(documents)
+    def search(self, query: str, k: int = 3) -> List[Dict]:
+        """Search for most relevant chunks given a query"""
+        query_vector = self.model.encode(query, convert_to_tensor=True)
+        query_vector_np = query_vector.cpu().numpy().reshape(1, -1).astype('float32')
 
-    def retrieve_relevant_chunks(self, query: str, k: int = 3) -> List[Dict[str, str]]:
-        """Retrieve top-k relevant documents for the query"""
-        query_embedding = self.embedding_model.encode([query])
+        # Search in FAISS index
+        distances, indices = self.index.search(query_vector_np, k)
 
-        distances, indices = self.vector_index.search(
-            np.array(query_embedding).astype('float32'), k
-        )
-
+        # Return relevant documents
         return [self.documents[i] for i in indices[0]]
 
-    def generate_response(self, query: str, context: List[Dict[str, str]]) -> Dict:
-        """Generate response using GPT-2 with retrieved context"""
-        # Combine context texts
-        context_texts = [doc['text'] for doc in context]
-        context_urls = [doc['url'] for doc in context]
 
-        prompt = f"Context: {' '.join(context_texts)}\n\nQuestion: {query}\n\nAnswer:"
+class LLMClient:
+    """Class to handle interactions with the RunPod LLM endpoint"""
 
-        inputs = self.llm_tokenizer(prompt, return_tensors="pt", padding=True)
+    def __init__(self, url: str):
+        self.url = url
+        self.headers = {'Content-Type': 'application/json'}
 
-        output_sequences = self.llm.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_length=150,
-            temperature=0.7,
-            num_return_sequences=1,
-            pad_token_id=self.llm_tokenizer.eos_token_id
+    def get_response(self, prompt: str, max_tokens: int = 200) -> str:
+        """Get response from LLM"""
+        payload = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "seed": 10
+        }
+
+        response = requests.post(
+            self.url,
+            headers=self.headers,
+            json=payload,
+            verify=False
         )
 
-        response_text = self.llm_tokenizer.decode(output_sequences[0], skip_special_tokens=True)
-        response_text = response_text.split("Answer:")[-1].strip()
-
-        return {
-            'response': response_text,
-            'sources': list(set(context_urls))  # Deduplicated source URLs
-        }
-
-    def process_query(self, query: str) -> Dict:
-        """Main RAG pipeline: retrieve + generate"""
-        relevant_chunks = self.retrieve_relevant_chunks(query)
-        response = self.generate_response(query, relevant_chunks)
-        return response
-
-
-def get_custom_css():
-    return """
-    <style>
-        .user-message {
-            background-color: #DCF8C6;
-            padding: 10px;
-            border-radius: 10px;
-            margin: 5px;
-            float: right;
-            clear: both;
-            max-width: 70%;
-        }
-        .bot-message {
-            background-color: #E8E8E8;
-            padding: 10px;
-            border-radius: 10px;
-            margin: 5px;
-            float: left;
-            clear: both;
-            max-width: 70%;
-        }
-        .sources {
-            font-size: 0.8em;
-            color: #666;
-            margin-top: 5px;
-        }
-        .message-container {
-            margin-bottom: 15px;
-            overflow: hidden;
-        }
-        .stButton>button {
-            width: 100%;
-        }
-    </style>
-    """
-
-
-def initialize_session_state():
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    if 'rag_system' not in st.session_state:
-        st.session_state.rag_system = None
-    if 'file_uploaded' not in st.session_state:
-        st.session_state.file_uploaded = False
-
-
-def load_rag_system_from_upload(uploaded_file):
-    if uploaded_file is not None:
-        try:
-            # Read the uploaded file
-            content = uploaded_file.getvalue().decode('utf-8')
-            lines = content.strip().split('\n')
-            data = [json.loads(line) for line in lines]
-
-            # Initialize the system
-            doc_processor = DocumentProcessor(chunk_size=3)
-            rag_system = RAGSystem()
-
-            # Process the data
-            texts = doc_processor.extract_text_from_jsonl(data)
-            chunks = doc_processor.create_chunks(texts)
-
-            # Add documents to the system
-            num_chunks = rag_system.add_documents(chunks)
-
-            st.session_state.rag_system = rag_system
-            st.session_state.file_uploaded = True
-            st.success(f'Successfully loaded {num_chunks} chunks from the uploaded file!')
-
-        except Exception as e:
-            st.error(f'Error processing file: {str(e)}')
-            st.session_state.file_uploaded = False
-    else:
-        st.session_state.file_uploaded = False
+        if response.status_code == 200:
+            return response.json()['choices'][0]['text']
+        else:
+            raise Exception(f"Failed to get response: {response.status_code}")
 
 
 def main():
-    st.set_page_config(page_title="College ChatBot", page_icon="🎓", layout="wide")
-    st.markdown(get_custom_css(), unsafe_allow_html=True)
+    st.title("RAG Chatbot")
 
-    initialize_session_state()
+    # Initialize components
+    llm_client = LLMClient("https://ke38c4ecupwr0t-5000.proxy.runpod.net/v1/completions")
+    vector_store = VectorStore()
 
-    st.title("College ChatBot 🎓")
+    # Sidebar for file upload and system status
+    with st.sidebar:
+        st.header("Data Upload")
+        uploaded_file = st.file_uploader("Upload your JSONL data", type=['jsonl'])
 
-    # File upload section
-    if not st.session_state.file_uploaded:
-        st.write("Please upload your JSONL file to start chatting:")
-        uploaded_file = st.file_uploader("Choose a JSONL file", type=['jsonl'])
-        if uploaded_file is not None:
-            load_rag_system_from_upload(uploaded_file)
+        if uploaded_file:
+            st.write("File Upload Status:")
+            # Load and process documents
+            with st.spinner('Loading JSONL file...'):
+                documents = DocumentProcessor.load_jsonl(uploaded_file)
+                st.success(f"✓ Loaded {len(documents)} documents")
 
-    # Only show chat interface if file is uploaded
-    if st.session_state.file_uploaded:
-        # Create a two-column layout
-        col1, col2 = st.columns([3, 1])
+            processor = DocumentProcessor()
+            with st.spinner('Creating chunks...'):
+                chunks = processor.create_semantic_chunks(documents)
+                st.success(f"✓ Created {len(chunks)} chunks")
 
-        with col1:
-            # Chat interface
-            chat_container = st.container()
-            with chat_container:
-                for message in st.session_state.messages:
-                    if message['role'] == 'user':
-                        st.markdown(f"""
-                            <div class="message-container">
-                                <div class="user-message">{message['content']}</div>
-                            </div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""
-                            <div class="message-container">
-                                <div class="bot-message">
-                                    {message['content']}
-                                    <div class="sources">Sources: {', '.join(message['sources'])}</div>
-                                </div>
-                            </div>
-                        """, unsafe_allow_html=True)
+            # Create embeddings and index
+            with st.spinner('Creating embeddings...'):
+                vector_store.create_embeddings(chunks)
+                st.success("✓ Created embeddings")
 
-            # Input section
-            with st.container():
-                user_input = st.text_input("Type your message...", key="user_input")
-                if st.button("Send", key="send_button") or user_input:
-                    if user_input:
-                        # Add user message
-                        st.session_state.messages.append({
-                            'role': 'user',
-                            'content': user_input
-                        })
+    # Main chat interface
+    if vector_store.index is not None:  # Only show chat if index is created
+        st.markdown("""
+        ### Chat Interface
+        Ask questions about your uploaded documents. The system will:
+        1. Find relevant content from your documents
+        2. Generate a response based on the found content
+        """)
 
-                        # Get bot response
-                        with st.spinner('Thinking...'):
-                            response = st.session_state.rag_system.process_query(user_input)
+        # Chat input
+        user_input = st.text_input("Your question:", key="user_input")
 
-                        # Add bot response
-                        st.session_state.messages.append({
-                            'role': 'assistant',
-                            'content': response['response'],
-                            'sources': response['sources']
-                        })
+        if user_input:
+            # Search relevant documents
+            relevant_docs = vector_store.search(user_input)
 
-                        # Clear input and rerun
-                        st.experimental_rerun()
+            # Create context from relevant documents
+            context = "\n".join([doc['content'] for doc in relevant_docs])
 
-        with col2:
-            # Sidebar for additional controls
-            if st.button("Clear Chat History"):
-                st.session_state.messages = []
-                st.experimental_rerun()
+            # Create prompt for LLM
+            prompt = f"""Based on the following context, please answer the question. 
+            If the answer cannot be found in the context, say 'I don't have enough information to answer that.'
 
-            if st.button("Upload New File"):
-                st.session_state.file_uploaded = False
-                st.session_state.rag_system = None
-                st.session_state.messages = []
-                st.experimental_rerun()
+            Context:
+            {context}
+
+            Question: {user_input}
+
+            Answer:"""
+
+            # Get response from LLM
+            with st.spinner('Thinking...'):
+                try:
+                    response = llm_client.get_response(prompt)
+
+                    # Add to conversation history
+                    st.session_state.conversation_history.append(("User", user_input))
+                    st.session_state.conversation_history.append(("Assistant", response))
+                except Exception as e:
+                    st.error(f"Error getting response: {str(e)}")
+
+        # Display conversation history
+        if st.session_state.conversation_history:
+            st.subheader("Conversation History")
+            for role, message in st.session_state.conversation_history:
+                if role == "User":
+                    st.markdown(f"🧑 **You:** {message}")
+                else:
+                    st.markdown(f"🤖 **Assistant:** {message}")
+    else:
+        st.info("👈 Please upload a JSONL file in the sidebar to start chatting!")
 
 
 if __name__ == "__main__":
