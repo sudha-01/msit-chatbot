@@ -1,7 +1,8 @@
 streamlit
-transformers
+requests
 faiss-cpu
+numpy
 sentence-transformers
 torch
-numpy
-nltk
+typing
+regex
